@@ -45,6 +45,17 @@ class AgentToolLoopTests(unittest.TestCase):
 
         self.assertEqual(result["content"], "hello")
         self.assertEqual(result["metrics"].prompt_tokens, 8)
+        self.assertIn("trace", result)
+        self.assertIn("request_fingerprint", result["trace"])
+        self.assertIn("history_role_counts_after", result["trace"])
+        self.assertEqual(result["trace"]["request_message_count"], 2)
+        self.assertEqual(result["trace"]["tool_rounds_executed"], 0)
+        self.assertEqual(result["trace"]["tool_call_count"], 0)
+        self.assertEqual(result["trace"]["tool_names_called"], [])
+        self.assertEqual(result["trace"]["tool_execution_count"], 0)
+        self.assertEqual(result["trace"]["tool_execution_results"], [])
+        self.assertFalse(result["trace"]["tool_loop_terminated_by_max_rounds"])
+        self.assertEqual(result["trace"]["pending_tool_calls_after_loop"], 0)
         self.assertEqual(len(agent.message_manager.get_api_messages()), 2)
         self.assertEqual(
             [message["role"] for message in agent.message_manager.get_api_messages()],
@@ -76,12 +87,46 @@ class AgentToolLoopTests(unittest.TestCase):
         self.assertEqual(result["content"], "final answer")
         self.assertEqual(result["metrics"].prompt_tokens, 22)
         self.assertEqual(result["metrics"].completion_tokens, 5)
+        self.assertEqual(result["trace"]["tool_rounds_executed"], 1)
+        self.assertEqual(result["trace"]["tool_call_count"], 1)
+        self.assertEqual(result["trace"]["tool_names_called"], ["read_file"])
+        self.assertEqual(result["trace"]["tool_message_count"], 1)
+        self.assertEqual(result["trace"]["tool_execution_count"], 1)
+        self.assertFalse(result["trace"]["tool_loop_terminated_by_max_rounds"])
+        self.assertEqual(result["trace"]["pending_tool_calls_after_loop"], 0)
+        self.assertEqual(result["trace"]["completion_round_count"], 2)
+        self.assertEqual(result["trace"]["history_role_counts_after"]["tool"], 1)
+        self.assertEqual(result["trace"]["tool_execution_results"][0]["tool_name"], "read_file")
+        self.assertTrue(result["trace"]["tool_execution_results"][0]["success"])
+        self.assertEqual(result["trace"]["tool_execution_results"][0]["status"], "ok")
         self.assertEqual(
             [message["role"] for message in messages],
             ["user", "assistant", "tool", "assistant"],
         )
         self.assertEqual(messages[2]["name"], "read_file")
         self.assertIn("README.md", messages[2]["content"])
+
+    def test_send_message_marks_when_max_tool_rounds_stops_loop(self):
+        agent = CacheAwareAgent(api_key="test", enable_tools=True, max_tool_rounds=0)
+        response = FakeResponse(
+            SimpleNamespace(
+                content=None,
+                tool_calls=[FakeToolCall("call_1", "read_file", '{"file_path": "README.md"}')],
+            ),
+            prompt_tokens=10,
+            completion_tokens=2,
+        )
+        agent._create_completion = lambda messages: response
+
+        result = agent.send_message("read the readme")
+
+        self.assertTrue(result["trace"]["assistant_has_tool_calls"])
+        self.assertTrue(result["trace"]["tool_loop_terminated_by_max_rounds"])
+        self.assertEqual(result["trace"]["pending_tool_calls_after_loop"], 1)
+        self.assertEqual(result["trace"]["pending_tool_names_after_loop"], ["read_file"])
+        self.assertEqual(result["trace"]["tool_execution_count"], 0)
+        self.assertEqual(result["trace"]["tool_execution_results"], [])
+        self.assertEqual(result["trace"]["completion_round_count"], 1)
 
     def test_enabled_tool_schemas_only_include_supported_tools(self):
         agent = CacheAwareAgent(api_key="test", enable_tools=True)

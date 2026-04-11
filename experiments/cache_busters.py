@@ -1,11 +1,9 @@
 """
-Cache breaker experiments split into two interpretable tracks:
+Cache breaker experiments split into interpretable experiment tracks.
 
-1. schema_only:
-   Focuses on prompt/message/session stability without active tool execution.
-2. execution_enabled:
-   Enables the minimal read_file/echo_json tool loop so tool-related cache
-   breakage can be evaluated separately from pure prefix stability issues.
+The core idea is to keep the execution logic generic while making tracks,
+question sets, and breaker scenarios explicit data so later experiment
+expansion does not require rewriting the runner itself.
 """
 
 from __future__ import annotations
@@ -16,18 +14,24 @@ import os
 import random
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Type
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.agent import CacheAwareAgent
+from experiments.experiment_utils import (
+    build_agent_config,
+    run_turn_sequence,
+    summarize_result_runs,
+)
 
 
-RESULTS_DIR = Path("results")
-COMBINED_OUTPUT = RESULTS_DIR / "cache_busters_results.json"
-SCHEMA_OUTPUT = RESULTS_DIR / "cache_busters_schema_only.json"
-EXECUTION_OUTPUT = RESULTS_DIR / "cache_busters_execution_enabled.json"
+DEFAULT_RESULTS_DIR = Path("results")
+COMBINED_FILENAME = "cache_busters_results.json"
+SCHEMA_FILENAME = "cache_busters_schema_only.json"
+EXECUTION_FILENAME = "cache_busters_execution_enabled.json"
 
 SCHEMA_ONLY_QUESTIONS = [
     "What is prompt caching?",
@@ -112,169 +116,336 @@ class BrokenAgent6_ModelSwitch(CacheAwareAgent):
         return super()._create_completion(messages)
 
 
-TRACK_CONFIGS: Dict[str, Dict[str, Any]] = {
-    "schema_only": {
-        "title": "Schema-Only Track",
-        "questions": SCHEMA_ONLY_QUESTIONS,
-        "agent_kwargs": {
+@dataclass(frozen=True)
+class ScenarioSpec:
+    """A single cache-breaker scenario definition."""
+
+    key: str
+    title: str
+    description: str
+    agent_class: Type[CacheAwareAgent]
+    category: str
+
+
+@dataclass(frozen=True)
+class TrackSpec:
+    """A runnable experiment track definition."""
+
+    key: str
+    title: str
+    description: str
+    questions: List[str]
+    agent_kwargs: Dict[str, Any]
+    baseline_dynamic_section: str
+    scenarios: List[ScenarioSpec]
+    output_filename: str
+
+
+SCENARIOS = {
+    "timestamp_static": ScenarioSpec(
+        key="timestamp_static",
+        title="1. Timestamp in Static Section",
+        description="Inject a dynamic timestamp into the static system prompt section.",
+        agent_class=BrokenAgent1_TimestampInStatic,
+        category="prompt_static",
+    ),
+    "dynamic_tools": ScenarioSpec(
+        key="dynamic_tools",
+        title="2. Dynamic Tool Add/Remove",
+        description="Change the exposed tool set between turns.",
+        agent_class=BrokenAgent2_DynamicTools,
+        category="tool_schema",
+    ),
+    "unstable_tool_order": ScenarioSpec(
+        key="unstable_tool_order",
+        title="3. Unstable Tool Order",
+        description="Shuffle enabled tool order on each request.",
+        agent_class=BrokenAgent3_UnstableToolOrder,
+        category="tool_schema",
+    ),
+    "modify_history": ScenarioSpec(
+        key="modify_history",
+        title="4. Modify Message History",
+        description="Mutate historical user content after the first turn.",
+        agent_class=BrokenAgent4_ModifyHistory,
+        category="message_history",
+    ),
+    "nondeterministic_serialization": ScenarioSpec(
+        key="nondeterministic_serialization",
+        title="5. Non-Deterministic Serialization",
+        description="Emit equivalent tool schemas with unstable key ordering.",
+        agent_class=BrokenAgent5_NonDeterministicSerialization,
+        category="tool_schema",
+    ),
+    "model_switch": ScenarioSpec(
+        key="model_switch",
+        title="6. Model Switch Mid-Session",
+        description="Switch completion models inside the same logical session.",
+        agent_class=BrokenAgent6_ModelSwitch,
+        category="session_config",
+    ),
+}
+
+TRACKS = {
+    "schema_only": TrackSpec(
+        key="schema_only",
+        title="Schema-Only Track",
+        description="Focus on prompt/message/session stability without active tool execution.",
+        questions=SCHEMA_ONLY_QUESTIONS,
+        agent_kwargs={
             "enable_tools": False,
             "temperature": 0.7,
         },
-        "baseline_dynamic_section": "Track mode: schema-only. Answer directly without using tools.",
-        "scenarios": [
-            (BrokenAgent1_TimestampInStatic, "1. Timestamp in Static Section"),
-            (BrokenAgent4_ModifyHistory, "4. Modify Message History"),
-            (BrokenAgent6_ModelSwitch, "6. Model Switch Mid-Session"),
+        baseline_dynamic_section="Track mode: schema-only. Answer directly without using tools.",
+        scenarios=[
+            SCENARIOS["timestamp_static"],
+            SCENARIOS["modify_history"],
+            SCENARIOS["model_switch"],
         ],
-        "output_file": SCHEMA_OUTPUT,
-    },
-    "execution_enabled": {
-        "title": "Execution-Enabled Track",
-        "questions": EXECUTION_ENABLED_QUESTIONS,
-        "agent_kwargs": {
+        output_filename=SCHEMA_FILENAME,
+    ),
+    "execution_enabled": TrackSpec(
+        key="execution_enabled",
+        title="Execution-Enabled Track",
+        description="Evaluate breaker effects when the minimal tool loop is active.",
+        questions=EXECUTION_ENABLED_QUESTIONS,
+        agent_kwargs={
             "enable_tools": True,
             "max_tool_rounds": 1,
             "temperature": 0.0,
         },
-        "baseline_dynamic_section": "Track mode: execution-enabled. Use tools when the user explicitly asks for file inspection.",
-        "scenarios": [
-            (BrokenAgent2_DynamicTools, "2. Dynamic Tool Add/Remove"),
-            (BrokenAgent3_UnstableToolOrder, "3. Unstable Tool Order"),
-            (BrokenAgent5_NonDeterministicSerialization, "5. Non-Deterministic Serialization"),
+        baseline_dynamic_section="Track mode: execution-enabled. Use tools when the user explicitly asks for file inspection.",
+        scenarios=[
+            SCENARIOS["dynamic_tools"],
+            SCENARIOS["unstable_tool_order"],
+            SCENARIOS["nondeterministic_serialization"],
         ],
-        "output_file": EXECUTION_OUTPUT,
-    },
+        output_filename=EXECUTION_FILENAME,
+    ),
 }
 
 
-def create_agent(agent_class: Type[CacheAwareAgent], track_name: str) -> CacheAwareAgent:
-    config = TRACK_CONFIGS[track_name]
+def resolve_output_file(output_dir: Path, filename: str) -> Path:
+    return output_dir / filename
+
+
+def create_agent(agent_class: Type[CacheAwareAgent], track: TrackSpec) -> CacheAwareAgent:
     agent = agent_class(
         model="deepseek-chat",
         max_tokens=1024,
-        **config["agent_kwargs"],
+        **track.agent_kwargs,
     )
-    agent.prompt_manager.add_dynamic_section(config["baseline_dynamic_section"])
+    agent.prompt_manager.add_dynamic_section(track.baseline_dynamic_section)
     return agent
 
 
-def run_track_baseline(track_name: str, num_turns: int) -> Dict[str, Any]:
-    config = TRACK_CONFIGS[track_name]
-    agent = create_agent(CacheAwareAgent, track_name)
+def build_track_metadata(track: TrackSpec, num_turns: int) -> Dict[str, Any]:
+    return {
+        "description": track.description,
+        "agent_kwargs": track.agent_kwargs,
+        "baseline_dynamic_section": track.baseline_dynamic_section,
+        "questions": track.questions[:num_turns],
+        "scenario_keys": [scenario.key for scenario in track.scenarios],
+        "scenario_titles": [scenario.title for scenario in track.scenarios],
+    }
+
+
+def run_track_baseline(track: TrackSpec, num_turns: int, run_id: int, seed: int) -> Dict[str, Any]:
+    agent = create_agent(CacheAwareAgent, track)
 
     print(f"\n{'=' * 80}")
-    print(f"Baseline: {config['title']}")
+    print(f"Baseline: {track.title}")
     print(f"{'=' * 80}\n")
 
-    for turn, question in enumerate(config["questions"][:num_turns], 1):
-        print(f"[Turn {turn}] User: {question}")
-        result = agent.send_message(question, verbose=True)
-        preview = (result["content"] or "")[:150]
-        print(f"[Turn {turn}] Assistant: {preview}...\n")
-
-    total_metrics = agent.get_total_metrics()
+    run_data = run_turn_sequence(agent, track.questions[:num_turns], verbose=True)
     return {
         "scenario": "Baseline",
-        "total_metrics": {
-            "cache_hit_rate": total_metrics.cache_hit_rate,
-            "cost": total_metrics.cost_estimate,
-            "cache_hit_tokens": total_metrics.cache_hit_tokens,
-            "cache_miss_tokens": total_metrics.cache_miss_tokens,
-            "prompt_tokens": total_metrics.prompt_tokens,
-            "completion_tokens": total_metrics.completion_tokens,
-        },
+        "scenario_key": "baseline",
+        "scenario_description": f"Baseline run for {track.title}.",
+        "run_id": run_id,
+        "seed": seed,
+        "config": build_agent_config(
+            agent,
+            extra={
+                "track": track.key,
+                "questions": track.questions[:num_turns],
+                "mode": "baseline",
+                "run_id": run_id,
+                "seed": seed,
+            },
+        ),
+        **run_data,
     }
 
 
 def run_cache_buster_experiment(
-    agent_class: Type[CacheAwareAgent],
-    scenario_name: str,
-    track_name: str,
+    track: TrackSpec,
+    scenario: ScenarioSpec,
     num_turns: int,
+    run_id: int,
+    seed: int,
 ) -> Dict[str, Any]:
-    config = TRACK_CONFIGS[track_name]
-
     print(f"\n{'=' * 80}")
-    print(f"{config['title']} | Scenario: {scenario_name}")
+    print(f"{track.title} | Scenario: {scenario.title}")
     print(f"{'=' * 80}\n")
 
-    agent = create_agent(agent_class, track_name)
+    agent = create_agent(scenario.agent_class, track)
+    run_data = run_turn_sequence(agent, track.questions[:num_turns], verbose=True)
+    total_metrics = run_data["total_metrics"]
 
-    for turn, question in enumerate(config["questions"][:num_turns], 1):
-        print(f"[Turn {turn}] User: {question}")
-        result = agent.send_message(question, verbose=True)
-        preview = (result["content"] or "")[:150]
-        print(f"[Turn {turn}] Assistant: {preview}...\n")
-
-    total_metrics = agent.get_total_metrics()
-    print(f"\nResults for {scenario_name}:")
-    print(f"  Cache Hit Rate: {total_metrics.cache_hit_rate:.1%}")
-    print(f"  Total Cost: ${total_metrics.cost_estimate:.6f}")
+    print(f"\nResults for {scenario.title}:")
+    print(f"  Cache Hit Rate: {total_metrics['cache_hit_rate']:.1%}")
+    print(f"  Total Cost: ${total_metrics['cost']:.6f}")
 
     return {
-        "scenario": scenario_name,
-        "total_metrics": {
-            "cache_hit_rate": total_metrics.cache_hit_rate,
-            "cost": total_metrics.cost_estimate,
-            "cache_hit_tokens": total_metrics.cache_hit_tokens,
-            "cache_miss_tokens": total_metrics.cache_miss_tokens,
-            "prompt_tokens": total_metrics.prompt_tokens,
-            "completion_tokens": total_metrics.completion_tokens,
-        },
+        "scenario": scenario.title,
+        "scenario_key": scenario.key,
+        "scenario_description": scenario.description,
+        "scenario_category": scenario.category,
+        "run_id": run_id,
+        "seed": seed,
+        "config": build_agent_config(
+            agent,
+            extra={
+                "track": track.key,
+                "questions": track.questions[:num_turns],
+                "mode": "scenario",
+                "scenario": scenario.title,
+                "scenario_key": scenario.key,
+                "scenario_category": scenario.category,
+                "agent_class": scenario.agent_class.__name__,
+                "run_id": run_id,
+                "seed": seed,
+            },
+        ),
+        **run_data,
     }
 
 
-def run_track(track_name: str, num_turns: int) -> Dict[str, Any]:
-    config = TRACK_CONFIGS[track_name]
+def run_track_once(track_key: str, num_turns: int, run_id: int, seed: int) -> Dict[str, Any]:
+    track = TRACKS[track_key]
+    random.seed(seed)
 
-    baseline = run_track_baseline(track_name, num_turns)
+    baseline = run_track_baseline(track, num_turns, run_id, seed)
     scenarios = [
-        run_cache_buster_experiment(agent_class, scenario_name, track_name, num_turns)
-        for agent_class, scenario_name in config["scenarios"]
+        run_cache_buster_experiment(track, scenario, num_turns, run_id, seed)
+        for scenario in track.scenarios
     ]
 
-    track_results = {
-        "track": track_name,
-        "title": config["title"],
+    return {
+        "track": track.key,
+        "title": track.title,
+        "schema_version": "v3",
+        "run_id": run_id,
+        "seed": seed,
         "num_turns": num_turns,
+        "config": build_track_metadata(track, num_turns),
         "baseline": baseline,
         "scenarios": scenarios,
     }
 
-    RESULTS_DIR.mkdir(exist_ok=True)
-    config["output_file"].write_text(
+
+def run_track(
+    track_key: str,
+    num_turns: int,
+    repeats: int = 1,
+    seed: int = 42,
+    output_dir: Path = DEFAULT_RESULTS_DIR,
+) -> Dict[str, Any]:
+    track = TRACKS[track_key]
+    runs = [
+        run_track_once(track_key, num_turns, run_id=index + 1, seed=seed + index)
+        for index in range(repeats)
+    ]
+
+    if repeats == 1:
+        track_results = runs[0]
+    else:
+        baseline_runs = [run["baseline"] for run in runs]
+        scenario_runs_by_key = {
+            scenario.key: [run["scenarios"][index] for run in runs]
+            for index, scenario in enumerate(track.scenarios)
+        }
+
+        track_results = {
+            "track": track.key,
+            "title": track.title,
+            "schema_version": "v3",
+            "num_turns": num_turns,
+            "repeat_count": repeats,
+            "base_seed": seed,
+            "config": build_track_metadata(track, num_turns),
+            "baseline": {
+                "scenario": "Baseline",
+                "scenario_key": "baseline",
+                "summary": summarize_result_runs(baseline_runs),
+                "runs": baseline_runs,
+            },
+            "scenarios": [
+                {
+                    "scenario": scenario.title,
+                    "scenario_key": scenario.key,
+                    "scenario_description": scenario.description,
+                    "scenario_category": scenario.category,
+                    "summary": summarize_result_runs(scenario_runs_by_key[scenario.key]),
+                    "runs": scenario_runs_by_key[scenario.key],
+                }
+                for scenario in track.scenarios
+            ],
+            "runs": runs,
+        }
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_file = resolve_output_file(output_dir, track.output_filename)
+    output_file.write_text(
         json.dumps(track_results, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
     return track_results
 
 
-def run_all_cache_busters(num_turns: int = 5) -> Dict[str, Any]:
+def run_all_cache_busters(
+    num_turns: int = 5,
+    repeats: int = 1,
+    seed: int = 42,
+    output_dir: Path = DEFAULT_RESULTS_DIR,
+) -> Dict[str, Any]:
     print("=" * 80)
     print("Cache Busters Experiment: Split Tracks")
     print("=" * 80)
 
-    schema_only = run_track("schema_only", num_turns)
-    execution_enabled = run_track("execution_enabled", num_turns)
+    schema_only = run_track("schema_only", num_turns, repeats=repeats, seed=seed, output_dir=output_dir)
+    execution_enabled = run_track(
+        "execution_enabled",
+        num_turns,
+        repeats=repeats,
+        seed=seed,
+        output_dir=output_dir,
+    )
 
     combined = {
         "experiment": "cache_busters",
+        "schema_version": "v3",
+        "repeat_count": repeats,
+        "base_seed": seed,
         "tracks": {
             "schema_only": schema_only,
             "execution_enabled": execution_enabled,
         },
     }
 
-    RESULTS_DIR.mkdir(exist_ok=True)
-    COMBINED_OUTPUT.write_text(
+    output_dir.mkdir(parents=True, exist_ok=True)
+    combined_output = resolve_output_file(output_dir, COMBINED_FILENAME)
+    schema_output = resolve_output_file(output_dir, SCHEMA_FILENAME)
+    execution_output = resolve_output_file(output_dir, EXECUTION_FILENAME)
+    combined_output.write_text(
         json.dumps(combined, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
 
-    print(f"\nResults saved to: {COMBINED_OUTPUT}")
-    print(f"Schema-only track saved to: {SCHEMA_OUTPUT}")
-    print(f"Execution-enabled track saved to: {EXECUTION_OUTPUT}")
-
+    print(f"\nResults saved to: {combined_output}")
+    print(f"Schema-only track saved to: {schema_output}")
+    print(f"Execution-enabled track saved to: {execution_output}")
     return combined
 
 
@@ -284,7 +455,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--track",
-        choices=["all", "schema_only", "execution_enabled"],
+        choices=["all", *TRACKS.keys()],
         default="all",
         help="Which experiment track to run.",
     )
@@ -300,21 +471,52 @@ def parse_args() -> argparse.Namespace:
         default=42,
         help="Random seed for repeatable scenario behavior.",
     )
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=1,
+        help="How many repeated runs to execute per track.",
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="Print available tracks and scenarios without running experiments.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=str(DEFAULT_RESULTS_DIR),
+        help="Directory where result artifacts should be written.",
+    )
     return parser.parse_args()
+
+
+def print_available_configs() -> None:
+    print("Available experiment tracks:")
+    for track in TRACKS.values():
+        print(f"- {track.key}: {track.title}")
+        print(f"  {track.description}")
+        for scenario in track.scenarios:
+            print(f"  - {scenario.key}: {scenario.title} [{scenario.category}]")
 
 
 if __name__ == "__main__":
     args = parse_args()
-    random.seed(args.seed)
 
-    if args.track == "all":
-        run_all_cache_busters(num_turns=args.turns)
-    else:
-        result = run_track(args.track, args.turns)
-        print(
-            json.dumps(
-                result,
-                indent=2,
-                ensure_ascii=False,
-            )
+    if args.list:
+        print_available_configs()
+    elif args.track == "all":
+        run_all_cache_busters(
+            num_turns=args.turns,
+            repeats=args.repeats,
+            seed=args.seed,
+            output_dir=Path(args.output_dir),
         )
+    else:
+        result = run_track(
+            args.track,
+            args.turns,
+            repeats=args.repeats,
+            seed=args.seed,
+            output_dir=Path(args.output_dir),
+        )
+        print(json.dumps(result, indent=2, ensure_ascii=False))

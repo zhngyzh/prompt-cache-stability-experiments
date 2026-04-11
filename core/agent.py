@@ -5,8 +5,10 @@ This version keeps the current single-completion behavior, but splits the flow
 into smaller helpers so a tool-calling loop can be added incrementally.
 """
 
+import hashlib
 import json
 import os
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -17,7 +19,7 @@ from openai import OpenAI
 from core.message_manager import AppendOnlyMessageManager, Message
 from core.prompt_manager import create_default_prompt_manager
 from core.tool_cache import create_default_tool_cache
-from core.tool_executor import create_default_tool_executor
+from core.tool_executor import ToolExecutionResult, create_default_tool_executor
 
 
 @dataclass
@@ -191,6 +193,18 @@ class CacheAwareAgent:
                 f"Rate: {metrics.cache_hit_rate:.1%}, Cost: ${metrics.cost_estimate:.6f}"
             )
 
+    def _fingerprint(self, value: Any) -> str:
+        """Create a stable short fingerprint for tracing request structure."""
+        payload = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+    def _count_message_roles(self, messages: List[Dict[str, Any]]) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        for message in messages:
+            role = message["role"]
+            counts[role] = counts.get(role, 0) + 1
+        return counts
+
     def _get_tool_call_name(self, tool_call: Any) -> str:
         if isinstance(tool_call, dict):
             return tool_call["function"]["name"]
@@ -222,7 +236,28 @@ class CacheAwareAgent:
             )
         )
 
-    def _execute_tool_calls(self, tool_calls: List[Any]) -> None:
+    def _summarize_tool_result(
+        self,
+        tool_call_id: str,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        result: ToolExecutionResult,
+    ) -> Dict[str, Any]:
+        summary = {
+            "tool_call_id": tool_call_id,
+            "tool_name": tool_name,
+            "arguments_fingerprint": self._fingerprint(arguments),
+            "status": result.status,
+            "success": result.success,
+        }
+        if result.output is not None:
+            summary["output_keys"] = sorted(result.output.keys())
+        if result.error is not None:
+            summary["error"] = result.error
+        return summary
+
+    def _execute_tool_calls(self, tool_calls: List[Any]) -> List[Dict[str, Any]]:
+        execution_summaries: List[Dict[str, Any]] = []
         for tool_call in tool_calls:
             tool_name = self._get_tool_call_name(tool_call)
             arguments = self._get_tool_call_arguments(tool_call)
@@ -234,6 +269,15 @@ class CacheAwareAgent:
                 tool_name=tool_name,
                 content=result.to_message_content(),
             )
+            execution_summaries.append(
+                self._summarize_tool_result(
+                    tool_call_id=tool_call_id,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    result=result,
+                )
+            )
+        return execution_summaries
 
     def send_message(self, user_message: str, verbose: bool = False) -> Dict[str, Any]:
         """
@@ -244,8 +288,12 @@ class CacheAwareAgent:
         request/append/metrics steps.
         """
 
+        started_at = time.perf_counter()
+        history_message_count_before = len(self.message_manager)
+
         self._append_user_message(user_message)
         messages = self._build_api_messages()
+        enabled_tool_schemas = self._get_enabled_tool_schemas() if self.enable_tools else []
         response = self._create_completion(messages)
         total_metrics = self._build_metrics(response)
 
@@ -253,21 +301,79 @@ class CacheAwareAgent:
         self._append_assistant_message(assistant_message)
 
         tool_rounds = 0
+        tool_names_called: List[str] = []
+        tool_execution_results: List[Dict[str, Any]] = []
+        completion_rounds = 1
+        total_tool_calls = len(assistant_message.tool_calls or [])
+        tool_names_called.extend(self._get_tool_call_name(tool_call) for tool_call in (assistant_message.tool_calls or []))
         while self.enable_tools and assistant_message.tool_calls and tool_rounds < self.max_tool_rounds:
-            self._execute_tool_calls(assistant_message.tool_calls)
+            tool_execution_results.extend(self._execute_tool_calls(assistant_message.tool_calls))
             follow_up_messages = self._build_api_messages()
             follow_up_response = self._create_completion(follow_up_messages)
             assistant_message = follow_up_response.choices[0].message
             self._append_assistant_message(assistant_message)
             total_metrics = total_metrics + self._build_metrics(follow_up_response)
+            total_tool_calls += len(assistant_message.tool_calls or [])
+            tool_names_called.extend(
+                self._get_tool_call_name(tool_call) for tool_call in (assistant_message.tool_calls or [])
+            )
             tool_rounds += 1
+            completion_rounds += 1
+
+        pending_tool_calls_after_loop = len(assistant_message.tool_calls or [])
+        tool_loop_terminated_by_max_rounds = bool(
+            self.enable_tools
+            and assistant_message.tool_calls
+            and tool_rounds >= self.max_tool_rounds
+        )
 
         self._record_metrics(total_metrics, verbose=verbose)
+
+        final_messages = self.message_manager.get_api_messages()
+        role_counts_after = self._count_message_roles(final_messages)
+        tool_messages = [message for message in final_messages if message["role"] == "tool"]
+        trace = {
+            "latency_ms": round((time.perf_counter() - started_at) * 1000, 3),
+            "model": self.session_config.model,
+            "temperature": self.session_config.temperature,
+            "enable_tools": self.enable_tools,
+            "enabled_tool_names": [schema["function"]["name"] for schema in enabled_tool_schemas],
+            "tool_schema_fingerprint": self._fingerprint(enabled_tool_schemas),
+            "system_prompt_fingerprint": self._fingerprint(messages[0]["content"]),
+            "request_fingerprint": self._fingerprint(
+                {
+                    "model": self.session_config.model,
+                    "messages": messages,
+                    "tools": enabled_tool_schemas,
+                }
+            ),
+            "history_fingerprint_after": self._fingerprint(final_messages),
+            "history_message_count_before": history_message_count_before,
+            "history_message_count_after": len(final_messages),
+            "history_role_counts_after": role_counts_after,
+            "request_message_count": len(messages),
+            "tool_rounds_executed": tool_rounds,
+            "tool_call_count": total_tool_calls,
+            "tool_message_count": len(tool_messages),
+            "tool_names_called": tool_names_called,
+            "tool_execution_results": tool_execution_results,
+            "tool_execution_count": len(tool_execution_results),
+            "tool_loop_terminated_by_max_rounds": tool_loop_terminated_by_max_rounds,
+            "pending_tool_calls_after_loop": pending_tool_calls_after_loop,
+            "pending_tool_names_after_loop": [
+                self._get_tool_call_name(tool_call) for tool_call in (assistant_message.tool_calls or [])
+            ],
+            "completion_round_count": completion_rounds,
+            "assistant_response_chars": len(assistant_message.content or ""),
+            "assistant_response_preview": (assistant_message.content or "")[:120],
+            "assistant_has_tool_calls": bool(assistant_message.tool_calls),
+        }
 
         return {
             "content": assistant_message.content,
             "tool_calls": assistant_message.tool_calls,
             "metrics": total_metrics,
+            "trace": trace,
         }
 
     def get_total_metrics(self) -> CacheMetrics:

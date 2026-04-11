@@ -13,7 +13,28 @@ from pathlib import Path
 from typing import Any, Callable, Dict
 
 
-ToolHandler = Callable[[dict[str, Any]], dict[str, Any]]
+ToolHandler = Callable[[dict[str, Any], "LocalToolExecutor"], dict[str, Any]]
+
+
+@dataclass
+class ToolExecutionError(Exception):
+    """Structured tool execution error."""
+
+    code: str
+    message: str
+    details: dict[str, Any] | None = None
+
+    def to_payload(self) -> dict[str, Any]:
+        payload = {
+            "code": self.code,
+            "message": self.message,
+        }
+        if self.details:
+            payload["details"] = self.details
+        return payload
+
+    def __str__(self) -> str:
+        return self.message
 
 
 @dataclass
@@ -22,14 +43,38 @@ class ToolExecutionResult:
 
     name: str
     success: bool
-    output: dict[str, Any]
+    status: str
+    output: dict[str, Any] | None = None
+    error: dict[str, Any] | None = None
+
+    @classmethod
+    def ok(cls, name: str, output: dict[str, Any]) -> "ToolExecutionResult":
+        return cls(name=name, success=True, status="ok", output=output, error=None)
+
+    @classmethod
+    def failure(
+        cls,
+        name: str,
+        code: str,
+        message: str,
+        details: dict[str, Any] | None = None,
+    ) -> "ToolExecutionResult":
+        return cls(
+            name=name,
+            success=False,
+            status="error",
+            output=None,
+            error=ToolExecutionError(code=code, message=message, details=details).to_payload(),
+        )
 
     def to_message_content(self) -> str:
         """Serialize output deterministically for stable tool messages."""
         payload = {
             "tool": self.name,
+            "status": self.status,
             "success": self.success,
             "output": self.output,
+            "error": self.error,
         }
         return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
@@ -37,8 +82,9 @@ class ToolExecutionResult:
 class LocalToolExecutor:
     """Simple registry-based local tool executor."""
 
-    def __init__(self) -> None:
+    def __init__(self, workspace_root: str | Path | None = None) -> None:
         self._handlers: Dict[str, ToolHandler] = {}
+        self.workspace_root = Path(workspace_root or Path.cwd()).expanduser().resolve()
 
     def register(self, name: str, handler: ToolHandler) -> None:
         self._handlers[name] = handler
@@ -46,40 +92,102 @@ class LocalToolExecutor:
     def supports(self, name: str) -> bool:
         return name in self._handlers
 
+    def resolve_workspace_path(self, file_path: str) -> Path:
+        path = Path(file_path).expanduser()
+        if not path.is_absolute():
+            path = self.workspace_root / path
+        return path.resolve()
+
+    def ensure_within_workspace(self, path: Path) -> None:
+        if not path.is_relative_to(self.workspace_root):
+            raise ToolExecutionError(
+                code="path_not_allowed",
+                message="Access denied outside workspace root.",
+                details={
+                    "requested_path": str(path),
+                    "workspace_root": str(self.workspace_root),
+                },
+            )
+
     def execute(self, name: str, arguments: dict[str, Any]) -> ToolExecutionResult:
         if name not in self._handlers:
-            return ToolExecutionResult(
+            return ToolExecutionResult.failure(
                 name=name,
-                success=False,
-                output={"error": f"Unsupported tool: {name}"},
+                code="unsupported_tool",
+                message=f"Unsupported tool: {name}",
             )
 
         try:
-            output = self._handlers[name](arguments)
-            return ToolExecutionResult(name=name, success=True, output=output)
-        except Exception as exc:  # noqa: BLE001
+            output = self._handlers[name](arguments, self)
+            return ToolExecutionResult.ok(name=name, output=output)
+        except ToolExecutionError as exc:
             return ToolExecutionResult(
                 name=name,
                 success=False,
-                output={"error": str(exc)},
+                status="error",
+                output=None,
+                error=exc.to_payload(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ToolExecutionResult.failure(
+                name=name,
+                code="tool_execution_failed",
+                message=str(exc),
             )
 
 
-def _read_file_handler(arguments: dict[str, Any]) -> dict[str, Any]:
-    file_path = arguments["file_path"]
-    path = Path(file_path).expanduser().resolve()
+def _require_string_argument(arguments: dict[str, Any], key: str) -> str:
+    value = arguments.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ToolExecutionError(
+            code="invalid_arguments",
+            message=f"Expected a non-empty string argument: {key}",
+            details={"argument": key},
+        )
+    return value
+
+
+def _read_file_handler(arguments: dict[str, Any], executor: LocalToolExecutor) -> dict[str, Any]:
+    file_path = _require_string_argument(arguments, "file_path")
+    path = executor.resolve_workspace_path(file_path)
+    executor.ensure_within_workspace(path)
+
+    if not path.exists():
+        raise ToolExecutionError(
+            code="file_not_found",
+            message="Requested file does not exist.",
+            details={"requested_path": str(path)},
+        )
+
+    if not path.is_file():
+        raise ToolExecutionError(
+            code="not_a_file",
+            message="Requested path is not a file.",
+            details={"requested_path": str(path)},
+        )
+
+    try:
+        content = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise ToolExecutionError(
+            code="decode_error",
+            message="Requested file is not valid UTF-8 text.",
+            details={"requested_path": str(path), "reason": str(exc)},
+        ) from exc
 
     return {
         "file_path": str(path),
-        "content": path.read_text(encoding="utf-8"),
+        "workspace_relative_path": path.relative_to(executor.workspace_root).as_posix(),
+        "content": content,
     }
 
 
-def _echo_json_handler(arguments: dict[str, Any]) -> dict[str, Any]:
-    return {"text": arguments["text"]}
+def _echo_json_handler(arguments: dict[str, Any], executor: LocalToolExecutor) -> dict[str, Any]:
+    del executor
+    return {"text": _require_string_argument(arguments, "text")}
 
 
-def create_default_tool_executor() -> LocalToolExecutor:
+def create_default_tool_executor(workspace_root: str | Path | None = None) -> LocalToolExecutor:
     """
     Create the deterministic tool set for the first tool-calling phase.
 
@@ -87,7 +195,7 @@ def create_default_tool_executor() -> LocalToolExecutor:
     cache experiments remain easy to reason about.
     """
 
-    executor = LocalToolExecutor()
+    executor = LocalToolExecutor(workspace_root=workspace_root)
     executor.register("echo_json", _echo_json_handler)
     executor.register("read_file", _read_file_handler)
     return executor
