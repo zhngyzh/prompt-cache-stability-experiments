@@ -68,7 +68,7 @@ def build_experiment_metadata(num_turns: int, max_tool_rounds: int) -> Dict[str,
 
 def print_run_summary(run_data: Dict[str, Any]) -> None:
     total_metrics = run_data["total_metrics"]
-    tool_obs = run_data["tool_observability"]
+    tool_obs = run_data["tool_observability"]["metrics"]
 
     print()
     print("=" * 80)
@@ -85,13 +85,15 @@ def print_run_summary(run_data: Dict[str, Any]) -> None:
     print(f"  Total Cost: ${total_metrics['cost']:.6f}")
 
     print("\nTool Observability:")
-    print(f"  Tool Execution Count: {tool_obs['tool_execution_count']}")
+    print(f"  Tool Execution Count: {tool_obs['total_tool_executions']}")
     print(f"  Tool Success Rate: {tool_obs['tool_success_rate']:.1%}")
-    print(f"  Truncated by max_tool_rounds: {tool_obs['truncated_by_max_tool_rounds']}")
-    if tool_obs["tools_executed"]:
-        print(f"  Tools Executed: {', '.join(tool_obs['tools_executed'])}")
-    if tool_obs["error_codes"]:
-        print(f"  Error Codes: {tool_obs['error_codes']}")
+    print(f"  Truncated by max_tool_rounds: {tool_obs['turns_terminated_by_max_rounds']}")
+    tool_name_counts = run_data["tool_observability"].get("tool_name_counts", {})
+    error_code_counts = run_data["tool_observability"].get("error_code_counts", {})
+    if tool_name_counts:
+        print(f"  Tools Executed: {', '.join(tool_name_counts.keys())}")
+    if error_code_counts:
+        print(f"  Error Codes: {error_code_counts}")
 
     print("\nPer-Turn Analysis:")
     print(f"{'Turn':<6} {'Hit':<10} {'Miss':<10} {'Rate':<8} {'Cost':<12} {'Tools':<6}")
