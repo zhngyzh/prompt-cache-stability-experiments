@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Type
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.agent import CacheAwareAgent
+from core.agent import CacheAwareAgent, SessionConfig
 from experiments.experiment_utils import (
     build_agent_config,
     run_turn_sequence,
@@ -112,7 +112,14 @@ class BrokenAgent6_ModelSwitch(CacheAwareAgent):
     """Switch models between requests inside the same session."""
 
     def _create_completion(self, messages: List[Dict[str, Any]]) -> Any:
-        self.session_config.model = random.choice(["deepseek-chat", "deepseek-reasoner"])
+        # Replace the frozen session_config with a new instance
+        new_model = random.choice(["deepseek-chat", "deepseek-reasoner"])
+        self.session_config = SessionConfig(
+            model=new_model,
+            temperature=self.session_config.temperature,
+            max_tokens=self.session_config.max_tokens,
+            timestamp=self.session_config.timestamp,
+        )
         return super()._create_completion(messages)
 
 
