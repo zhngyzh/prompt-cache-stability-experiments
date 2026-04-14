@@ -34,13 +34,15 @@
 
 当前支持的确定性本地工具：
 
-- `read_file`
-- `echo_json`
+- `echo_json` - 返回确定性 JSON 响应
+- `list_directory` - 列出目录内容（按名称排序）
+- `read_file` - 读取文件内容
+- `search_content` - 在文件中搜索关键词
+- `write_file` - 写入文件内容
 
 当前未完成：
 
 - 多轮复杂工具编排
-- 更多本地工具与权限模型
 - 面向生产场景的 agent 容错与调度
 
 ## 四层缓存友好架构
@@ -253,7 +255,7 @@ python experiments/cache_busters.py --track execution_enabled --turns 5 --seed 4
 .venv\Scripts\python -m unittest discover -s tests
 ```
 
-当前测试覆盖数：`18`
+当前测试覆盖数：`27`
 
 ## 当前 Tools 状态
 
@@ -266,8 +268,11 @@ python experiments/cache_busters.py --track execution_enabled --turns 5 --seed 4
 
 当前工具层还有这些工程特性：
 
-- `read_file` 仅允许访问工作区内文件
+- 所有工具仅允许访问工作区内文件（路径安全检查）
 - 工具返回统一结构：`status / output / error`
+- `list_directory` 返回按名称排序的条目，保证确定性
+- `search_content` 返回行号和匹配内容
+- `write_file` 自动创建父目录
 - trace 中记录工具执行摘要、错误码、是否被 `max_tool_rounds` 截断
 
 默认情况下 tools 不启用，因此不会影响 baseline / schema-only 实验。

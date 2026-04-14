@@ -150,10 +150,50 @@ def create_echo_json_tool() -> BaseTool:
     )
 
 
+def create_list_directory_tool() -> BaseTool:
+    return BaseTool(
+        name="list_directory",
+        description="List the contents of a directory within the workspace",
+        parameters={
+            "type": "object",
+            "properties": {
+                "dir_path": {
+                    "type": "string",
+                    "description": "Path to the directory to list",
+                }
+            },
+            "required": ["dir_path"],
+        },
+    )
+
+
+def create_search_content_tool() -> BaseTool:
+    return BaseTool(
+        name="search_content",
+        description="Search for a keyword in a text file and return matching lines",
+        parameters={
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "Path to the file to search",
+                },
+                "keyword": {
+                    "type": "string",
+                    "description": "Keyword to search for",
+                },
+            },
+            "required": ["file_path", "keyword"],
+        },
+    )
+
+
 def create_default_tool_cache() -> ToolSchemaCache:
     cache = ToolSchemaCache()
     cache.register_tool(create_echo_json_tool())
+    cache.register_tool(create_list_directory_tool())
     cache.register_tool(create_read_file_tool())
+    cache.register_tool(create_search_content_tool())
     cache.register_tool(create_write_file_tool())
     cache.register_tool(create_python_execute_tool())
     return cache

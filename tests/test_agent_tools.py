@@ -133,7 +133,7 @@ class AgentToolLoopTests(unittest.TestCase):
 
         enabled_names = [schema["function"]["name"] for schema in agent._get_enabled_tool_schemas()]
 
-        self.assertEqual(enabled_names, ["echo_json", "read_file"])
+        self.assertEqual(enabled_names, ["echo_json", "list_directory", "read_file", "search_content", "write_file"])
 
 
 if __name__ == "__main__":
